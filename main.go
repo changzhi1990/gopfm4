@@ -104,8 +104,7 @@ func xcollectContainerCPI() {
 		}
 	}
 	wg.Wait()
-
-	time.Sleep(10 * time.Second)
+	time.Sleep(2 * time.Second)
 	var wg1 sync.WaitGroup
 	// var mutex sync.Mutex
 	wg1.Add(len(pods))
@@ -237,6 +236,6 @@ func main() {
 
 	go wait.Until(func() {
 		xcollectContainerCPI()
-	}, 30*time.Second, ctx.Done())
+	}, 5*time.Second, ctx.Done())
 	wg.Wait()
 }

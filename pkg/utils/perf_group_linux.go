@@ -156,8 +156,7 @@ type perfValueHeader struct {
 	TimeRunning uint64 // time event on CPU
 }
 
-// first event is group leader
-func NewPerfGroupCollector(cgroupFile *os.File, cpus []int, events []string, syscallFunc func(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err syscall.Errno)) (collector *PerfGroupCollector, err error) {
+func CreatePerfGroupCollector(cgroupFile *os.File, cpus []int, events []string, syscallFunc func(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err syscall.Errno)) (collector *PerfGroupCollector, err error) {
 	if len(events) == 0 {
 		err = errors.New("events cannot be empty")
 		return nil, err
@@ -231,27 +230,48 @@ func NewPerfGroupCollector(cgroupFile *os.File, cpus []int, events []string, sys
 				collector.idEventMap[id] = events[i]
 				collector.mu.Unlock()
 			}
-			// enable perf group
-			_, _, e1 = collector.syscall6(syscall.SYS_IOCTL, leaderFd.Fd(), uintptr(unix.PERF_EVENT_IOC_RESET), unix.PERF_IOC_FLAG_GROUP, 0, 0, 0)
-			if e1 != syscall.Errno(0) {
-				errMutex.Lock()
-				err = multierr.Append(err, fmt.Errorf("failed to reset perf group, Error: %s, cpu: %d, events: %s", unix.ErrnoName(e1), cpu, events))
-				errMutex.Unlock()
-				return
-			}
-			_, _, e1 = collector.syscall6(syscall.SYS_IOCTL, leaderFd.Fd(), uintptr(unix.PERF_EVENT_IOC_ENABLE), unix.PERF_IOC_FLAG_GROUP, 0, 0, 0)
-			if e1 != syscall.Errno(0) {
-				errMutex.Lock()
-				err = multierr.Append(err, fmt.Errorf("failed to enable perf group, Error: %s, cpu: %d, events: %s", unix.ErrnoName(e1), cpu, events))
-				errMutex.Unlock()
-				return
-			}
 			collector.perfCollectors.Store(cpu, &pc)
 			runtime.LockOSThread()
 		}(cpu)
 	}
 	wg.Wait()
+	return collector, err
+}
 
+func ResetAndEnablePerfGroupCollector(collector *PerfGroupCollector, cgroupFile *os.File, cpus []int, events []string, syscallFunc func(trap, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err syscall.Errno)) (*PerfGroupCollector, error) {
+	var err error
+	if len(events) == 0 {
+		err = errors.New("events cannot be empty")
+		return nil, err
+	}
+	var wg sync.WaitGroup
+	wg.Add(len(cpus))
+	var errMutex sync.Mutex
+	for _, cpu := range cpus {
+		go func(cpu int) {
+			defer wg.Done()
+			if pcInf, ok := collector.perfCollectors.Load(cpu); ok {
+				pc := pcInf.(*perfCollector)
+				leaderFd := pc.leaderFd.(*os.File)
+				_, _, e1 := collector.syscall6(syscall.SYS_IOCTL, leaderFd.Fd(), uintptr(unix.PERF_EVENT_IOC_RESET), uintptr(unix.PERF_IOC_FLAG_GROUP), 0, 0, 0)
+				if e1 != syscall.Errno(0) {
+					errMutex.Lock()
+					err = multierr.Append(err, fmt.Errorf("failed to reset perf group, Error: %s, cpu: %d, events: %s", unix.ErrnoName(e1), cpu, events))
+					errMutex.Unlock()
+					return
+				}
+				_, _, e1 = collector.syscall6(syscall.SYS_IOCTL, leaderFd.Fd(), uintptr(unix.PERF_EVENT_IOC_ENABLE), unix.PERF_IOC_FLAG_GROUP, 0, 0, 0)
+				if e1 != syscall.Errno(0) {
+					errMutex.Lock()
+					err = multierr.Append(err, fmt.Errorf("failed to enable perf group, Error: %s, cpu: %d, events: %s", unix.ErrnoName(e1), cpu, events))
+					errMutex.Unlock()
+					return
+				}
+				runtime.LockOSThread()
+			}
+		}(cpu)
+	}
+	wg.Wait()
 	// collect and statistic perf result
 	go func() {
 		for value := range collector.valueCh {
@@ -263,7 +283,12 @@ func NewPerfGroupCollector(cgroupFile *os.File, cpus []int, events []string, sys
 }
 
 func GetAndStartPerfGroupCollectorOnContainer(cgroupFile *os.File, cpus []int, events []string) (*PerfGroupCollector, error) {
-	collector, err := NewPerfGroupCollector(cgroupFile, cpus, events, syscall.Syscall6)
+	cg, err := CreatePerfGroupCollector(cgroupFile, cpus, events, syscall.Syscall6)
+	if err != nil {
+		klog.Info("err ", err)
+	}
+	collector, err := ResetAndEnablePerfGroupCollector(cg, cgroupFile, cpus, events, syscall.Syscall6)
+
 	if err != nil {
 		return nil, err
 	}
