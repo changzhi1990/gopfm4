@@ -26,7 +26,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"runtime"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -231,7 +230,7 @@ func CreatePerfGroupCollector(cgroupFile *os.File, cpus []int, events []string, 
 				collector.mu.Unlock()
 			}
 			collector.perfCollectors.Store(cpu, &pc)
-			runtime.LockOSThread()
+			//runtime.LockOSThread()
 		}(cpu)
 	}
 	wg.Wait()
@@ -267,7 +266,9 @@ func ResetAndEnablePerfGroupCollector(collector *PerfGroupCollector, cgroupFile 
 					errMutex.Unlock()
 					return
 				}
-				runtime.LockOSThread()
+				//runtime.LockOSThread()
+			} else {
+				klog.Info("perf collector on cpu not found")
 			}
 		}(cpu)
 	}
@@ -279,6 +280,7 @@ func ResetAndEnablePerfGroupCollector(collector *PerfGroupCollector, cgroupFile 
 		}
 		close(collector.closeCh)
 	}()
+
 	return collector, err
 }
 
@@ -381,6 +383,7 @@ func (p *perfCollector) collect(ch chan perfValue) error {
 	}
 	bufPool := BufPools[len(p.fds)+1]
 	buf := bufPool.Get().(*[]byte)
+	klog.Info("buf ", buf)
 	defer bufPool.Put(buf)
 	_, err := p.leaderFd.Read(*buf)
 	if err != nil {
@@ -396,7 +399,6 @@ func (p *perfCollector) collect(ch chan perfValue) error {
 	if header.TimeRunning != 0 && header.TimeEnabled != 0 {
 		scalingRatio = float64(header.TimeRunning) / float64(header.TimeEnabled)
 	}
-
 	for i := 0; i < int(header.Nr); i++ {
 		v := perfValuePool.Get().(*value)
 		defer perfValuePool.Put(v)
