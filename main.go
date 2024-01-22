@@ -1,12 +1,12 @@
 package main
 
 import (
-	"net/http"
 	_ "net/http/pprof"
 	"os"
 	"runtime"
 	"runtime/debug"
 	"sync"
+	"syscall"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -26,13 +26,91 @@ var (
 		"CPICollector": {"cycles", "instructions", "LONGEST_LAT_CACHE.MISS"},
 	}
 	collectors sync.Map
-	//collectors = sync.Map{}
-	CPUNUM int
+	CPUNUM     int
 )
 
 func init() {
 	CPUNUM = runtime.NumCPU()
 	// CPUNUM = 1
+	collectors = sync.Map{} // store container id and its PerfGroupCollector
+}
+
+func getAllPods() ([]*corev1.Pod, error) {
+	pods, err := utils.GetPods("b49691d6a544.jf.intel.com", "default")
+	if err != nil {
+		klog.Fatal(err)
+	}
+	klog.Infof("There are %d pods in the default namespace.", len(pods))
+
+	return pods, nil
+}
+
+func CreateGlobalPerfMap(pods []*corev1.Pod) {
+	var wg sync.WaitGroup
+	wg.Add(len(pods))
+	for _, pod := range pods {
+		for _, container := range pod.Status.ContainerStatuses {
+			podCgroupDir, err := utils.CGroupDir(pod, &container)
+			if err != nil {
+				klog.Fatal(err)
+			}
+			if err != nil {
+				klog.Fatal(err)
+			}
+			go func(status *corev1.ContainerStatus, podCgroupDir string) {
+				defer wg.Done()
+				collectorOnSingleContainer, err := createPerfContainerCollector(podCgroupDir, status, int32(CPUNUM), EventsMap["CPICollector"])
+				if err != nil {
+					klog.Fatal(err)
+				}
+				collectors.Store(status.ContainerID, collectorOnSingleContainer)
+			}(&container, podCgroupDir)
+		}
+	}
+	wg.Wait()
+}
+
+func createPerfContainerCollector(podCgroupDir string, c *corev1.ContainerStatus, number int32, events []string) (*utils.PerfGroupCollector, error) {
+	cpus := make([]int, number)
+	for i := range cpus {
+		cpus[i] = i
+	}
+	// get file descriptor for cgroup mode perf_event_open
+	containerCgroupFile, err := getContainerCgroupFile(podCgroupDir, c)
+	if err != nil {
+		return nil, err
+	}
+
+	return utils.CreatePerfGroupCollector(containerCgroupFile, cpus, events, syscall.Syscall6)
+}
+
+func ResetAndStartPerfGroupCollector(pods []*corev1.Pod) {
+	// get all containers and its groupCollector
+	var wg sync.WaitGroup
+	cpus := make([]int, CPUNUM)
+	for i := range cpus {
+		cpus[i] = i
+	}
+
+	for _, pod := range pods {
+		for _, container := range pod.Status.ContainerStatuses {
+			wg.Add(1)
+			go func(status *corev1.ContainerStatus) {
+				defer wg.Done()
+				collectorInf, ok := collectors.Load(status.ContainerID)
+				if ok {
+					pc, _ := collectorInf.(*utils.PerfGroupCollector)
+					//get each perfGroupCollector and reset each fds
+					utils.XResetAndEnablePerfGroupCollector(pc, cpus)
+					// start perfGroupCollector leader fd
+				} else {
+					klog.Info("collector not found ")
+				}
+			}(&container)
+		}
+	}
+	// reset groupCollecotor, reset and enable all fds
+	wg.Wait()
 }
 
 func getContainerCgroupFile(podCgroupDir string, c *corev1.ContainerStatus) (*os.File, error) {
@@ -160,31 +238,31 @@ func createCollectors() (pods []*corev1.Pod) {
 	return pods
 }
 
-// func collectContainerCPI(pods []*corev1.Pod) {
-// 	var wg1 sync.WaitGroup
-// 	klog.Infof("Begin to collect data for the %d pods in the default namespace.", len(pods))
-// 	time.Sleep(1 * time.Second)
-// 	wg1.Add(len(pods))
-// 	for _, pod := range pods {
-// 		for _, container := range pod.Status.ContainerStatuses {
-// 			go func(status *corev1.ContainerStatus, pod *corev1.Pod) {
-// 				defer wg1.Done()
-// 				oneCollector, ok := collectors.Load(status.ContainerID)
-// 				if ok {
-// 					pc, _ := oneCollector.(*utils.PerfGroupCollector)
-// 					cycles, instructions, cache_misses, err := utils.GetContainerCyclesAndInstructionsGroup(pc)
-// 					//utils.CloseAllFds(pc)
-// 					if err != nil {
-// 						klog.Fatal(err)
-// 					}
-// 					klog.Info("cache-misses: ", cache_misses, " cycles: ", cycles, " instructions: ", instructions, " pod: ", pod.Name)
-// 				} else {
-// 					klog.Info("collector not found ")
-// 				}
-// 			}(&container, pod)
-// 		}
-// 	}
-// }
+func collectContainerCPI(pods []*corev1.Pod) {
+	var wg1 sync.WaitGroup
+	klog.Infof("Begin to collect data for the %d pods in the default namespace.", len(pods))
+	time.Sleep(10 * time.Second)
+	wg1.Add(len(pods))
+	for _, pod := range pods {
+		for _, container := range pod.Status.ContainerStatuses {
+			go func(status *corev1.ContainerStatus, pod *corev1.Pod) {
+				defer wg1.Done()
+				oneCollector, ok := collectors.Load(status.ContainerID)
+				if ok {
+					pc, _ := oneCollector.(*utils.PerfGroupCollector)
+					cycles, instructions, cache_misses, err := utils.GetContainerCyclesAndInstructionsGroup(pc)
+					//utils.CloseAllFds(pc)
+					if err != nil {
+						klog.Fatal(err)
+					}
+					klog.Info("cache-misses: ", cache_misses, " cycles: ", cycles, " instructions: ", instructions, " pod: ", pod.Name)
+				} else {
+					klog.Info("collector not found ")
+				}
+			}(&container, pod)
+		}
+	}
+}
 
 func main() {
 	//runtime.MemProfileRate = 128000
@@ -226,16 +304,19 @@ func main() {
 		utils.LibFinalize()
 	}()
 
-	go func() {
-		// 启动一个 http server，注意 pprof 相关的 handler 已经自动注册过了
-		if err := http.ListenAndServe(":6060", nil); err != nil {
-			klog.Fatal(err)
-		}
-	}()
-	// pods := createCollectors()
+	// go func() {
+	// 	// 启动一个 http server，注意 pprof 相关的 handler 已经自动注册过了
+	// 	if err := http.ListenAndServe(":6060", nil); err != nil {
+	// 		klog.Fatal(err)
+	// 	}
+	// }()
+	pods, _ := getAllPods()
+	CreateGlobalPerfMap(pods)
 
 	go wait.Until(func() {
-		xcollectContainerCPI()
-	}, 5*time.Second, ctx.Done())
+		ResetAndStartPerfGroupCollector(pods)
+		collectContainerCPI(pods)
+		// xcollectContainerCPI()
+	}, 30*time.Second, ctx.Done())
 	wg.Wait()
 }

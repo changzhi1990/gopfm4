@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -132,6 +133,14 @@ type PerfGroupCollector struct {
 	closeCh        chan struct{}
 }
 
+func (pgc *PerfGroupCollector) GetPerfCollectors(cpu int) (*perfCollector, bool) {
+	pcInf, ok := pgc.perfCollectors.Load(cpu)
+	if ok {
+		return pcInf.(*perfCollector), ok
+	}
+	return nil, false
+}
+
 type perfCollector struct {
 	cpu      int
 	syscall6 func(trap uintptr, a1 uintptr, a2 uintptr, a3 uintptr, a4 uintptr, a5 uintptr, a6 uintptr) (r1 uintptr, r2 uintptr, err syscall.Errno)
@@ -230,7 +239,7 @@ func CreatePerfGroupCollector(cgroupFile *os.File, cpus []int, events []string, 
 				collector.mu.Unlock()
 			}
 			collector.perfCollectors.Store(cpu, &pc)
-			//runtime.LockOSThread()
+			runtime.LockOSThread()
 		}(cpu)
 	}
 	wg.Wait()
@@ -266,7 +275,7 @@ func ResetAndEnablePerfGroupCollector(collector *PerfGroupCollector, cgroupFile 
 					errMutex.Unlock()
 					return
 				}
-				//runtime.LockOSThread()
+				runtime.LockOSThread()
 			} else {
 				klog.Info("perf collector on cpu not found")
 			}
@@ -277,6 +286,57 @@ func ResetAndEnablePerfGroupCollector(collector *PerfGroupCollector, cgroupFile 
 	go func() {
 		for value := range collector.valueCh {
 			collector.resultMap[collector.idEventMap[value.ID]] += value.Value
+		}
+		// changzhi comment
+		// Don't close this channel, because it will be used in the next round of perf collection
+		//close(collector.closeCh)
+	}()
+
+	return collector, err
+}
+
+func XResetAndEnablePerfGroupCollector(collector *PerfGroupCollector, cpus []int) (*PerfGroupCollector, error) {
+	var err error
+	var wg sync.WaitGroup
+	wg.Add(len(cpus))
+	var errMutex sync.Mutex
+	// renew the closeCh and valueCh
+	collector.closeCh = make(chan struct{})
+	collector.valueCh = make(chan perfValue)
+	collector.resultMap = make(map[string]float64)
+	for _, cpu := range cpus {
+		go func(cpu int) {
+			defer wg.Done()
+			if pcInf, ok := collector.perfCollectors.Load(cpu); ok {
+				pc := pcInf.(*perfCollector)
+				leaderFd := pc.leaderFd.(*os.File)
+				_, _, e1 := collector.syscall6(syscall.SYS_IOCTL, leaderFd.Fd(), uintptr(unix.PERF_EVENT_IOC_RESET), uintptr(unix.PERF_IOC_FLAG_GROUP), 0, 0, 0)
+				if e1 != syscall.Errno(0) {
+					errMutex.Lock()
+					err = multierr.Append(err, fmt.Errorf("failed to reset perf group, Error: %s, cpu: %d", unix.ErrnoName(e1), cpu))
+					errMutex.Unlock()
+					return
+				}
+				_, _, e1 = collector.syscall6(syscall.SYS_IOCTL, leaderFd.Fd(), uintptr(unix.PERF_EVENT_IOC_ENABLE), unix.PERF_IOC_FLAG_GROUP, 0, 0, 0)
+				if e1 != syscall.Errno(0) {
+					errMutex.Lock()
+					err = multierr.Append(err, fmt.Errorf("failed to enable perf group, Error: %s, cpu: %d", unix.ErrnoName(e1), cpu))
+					errMutex.Unlock()
+					return
+				}
+				runtime.LockOSThread()
+			} else {
+				klog.Info("perf collector on cpu not found")
+			}
+		}(cpu)
+	}
+	wg.Wait()
+	// collect and statistic perf result
+	go func() {
+		for value := range collector.valueCh {
+			collector.mu.Lock()
+			collector.resultMap[collector.idEventMap[value.ID]] += value.Value
+			collector.mu.Unlock()
 		}
 		close(collector.closeCh)
 	}()
@@ -316,6 +376,7 @@ func GetContainerPerfResult(collector *PerfGroupCollector) (map[string]float64, 
 		}(cpu)
 	}
 	wg.Wait()
+	// changzhi comment
 	err = multierr.Append(err, collector.cleanUp())
 	<-collector.closeCh
 
@@ -331,10 +392,10 @@ func GetContainerCyclesAndInstructionsGroup(collector *PerfGroupCollector) (floa
 }
 
 func (c *PerfGroupCollector) cleanUp() error {
-	err := c.cgroupFile.Close()
-	if err != nil {
-		return fmt.Errorf("close cgroupFile %v, err : %v", c.cgroupFile.Name(), err)
-	}
+	// err := c.cgroupFile.Close()
+	// if err != nil {
+	// 	return fmt.Errorf("close cgroupFile %v, err : %v", c.cgroupFile.Name(), err)
+	// }
 	close(c.valueCh)
 	return nil
 }
@@ -378,12 +439,12 @@ func pfmGetOsEventEncoding(event string, perfEventAttrPtr unsafe.Pointer) error 
 }
 
 func (p *perfCollector) collect(ch chan perfValue) error {
+	// changzhi comment
 	if err := p.stop(); err != nil {
 		return err
 	}
 	bufPool := BufPools[len(p.fds)+1]
 	buf := bufPool.Get().(*[]byte)
-	klog.Info("buf ", buf)
 	defer bufPool.Put(buf)
 	_, err := p.leaderFd.Read(*buf)
 	if err != nil {
@@ -410,12 +471,13 @@ func (p *perfCollector) collect(ch chan perfValue) error {
 		value.ID = v.ID
 		ch <- *value
 	}
-	return p.close()
+	return nil
 }
 
 // stop stops perf group counter
 func (p *perfCollector) stop() error {
 	f := p.leaderFd.(*os.File)
+	// DISABLE -> stop
 	_, _, e1 := p.syscall6(syscall.SYS_IOCTL, f.Fd(), uintptr(unix.PERF_EVENT_IOC_DISABLE), unix.PERF_IOC_FLAG_GROUP, 0, 0, 0)
 	if e1 != syscall.Errno(0) {
 		return errors.New(unix.ErrnoName(e1))
